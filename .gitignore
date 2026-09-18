@@ -1,0 +1,16 @@
+# Build artifacts
+target/
+
+# Test data (raw instrument files — too large for git)
+tests/test_data/
+
+# Generated / output files
+*.bin
+*.csv
+*.log
+*.safetensors
+*.zip
+
+# Backups and legacy reference model files (not part of DIAFluX)
+*.tgz
+models/
