@@ -59,6 +59,7 @@ fn main() -> Result<(), anyhow::Error> {
         // Pre-transform the library once per pass; shared across all replicate
         // runs (the fragment index is identical for every file).
         let mut prepared = diaflux::engine::prepare_ng_library(&lib);
+        diaflux::log::log_rss("lib + prepared library ready");
 
         let mut ng_config = diaflux::engine::NgConfig::default();
         let transfer_config = diaflux::engine::transfer_quant::TransferQuantConfig::default();
@@ -77,6 +78,7 @@ fn main() -> Result<(), anyhow::Error> {
             info!("DiaData: {} frames | {} cycles | {} mobility scans",
                 dia_data.frame_max_index, dia_data.precursor_cycle_max_index,
                 dia_data.scan_max_index);
+            diaflux::log::log_rss("dia_data loaded");
 
             let result = diaflux::engine::run_ng(&mut prepared, &dia_data, &ng_config);
             info!("DIA search: {} PSMs (q<=0.01), precursor quant groups: {}",
@@ -99,20 +101,36 @@ fn main() -> Result<(), anyhow::Error> {
             write_core_output(&out_dir, &run_name, &result, "")?;
         }
 
+        // Pass 1's spectral library and prepared form are dead weight for pass
+        // 2 (which loads its own fine-tuned library). Dropping them here keeps
+        // pass-2 peak memory at one library instead of two (~28 GiB saved; the
+        // pass-2 search otherwise OOMs the cgroup on large files).
+        drop(prepared);
+        drop(lib);
+
         // ── Pass 2: transfer-learning library refinement ──────────────────
         if cli.two_pass {
-            if all_psms.is_empty() {
-                bail!("--two-pass: no q<=0.01 PSMs to build a transfer library");
-            }
-            let transfer_lib = diaflux::engine::transfer_library::build_transfer_library(
-                &all_psms,
-                &diaflux::engine::transfer_library::TransferLibraryConfig::default(),
-            );
             let transfer_dir = match &cli.transfer_out {
                 Some(p) => PathBuf::from(p),
                 None => out_dir.join("transfer"),
             };
-            diaflux::output::write_transfer_library(&transfer_dir, &transfer_lib)?;
+            // Resume support: when pass-1 results were cached from an earlier
+            // (possibly interrupted) run, the transfer library already exists on
+            // disk even though `all_psms` is empty this time around. Reuse it
+            // instead of bailing so the fine-tune + re-search can still run.
+            let transfer_exists = transfer_dir.join("transfer_precursors.parquet").exists();
+            if all_psms.is_empty() && !transfer_exists {
+                bail!("--two-pass: no q<=0.01 PSMs to build a transfer library");
+            }
+            if transfer_exists {
+                info!("Transfer library already exists, reusing: {}", transfer_dir.display());
+            } else {
+                let transfer_lib = diaflux::engine::transfer_library::build_transfer_library(
+                    &all_psms,
+                    &diaflux::engine::transfer_library::TransferLibraryConfig::default(),
+                );
+                diaflux::output::write_transfer_library(&transfer_dir, &transfer_lib)?;
+            }
 
             // Second-pass fragment m/z tolerance: derive from the first-pass
             // observed mass errors (the reference's automatic MS2 optimizer),
@@ -140,7 +158,7 @@ fn main() -> Result<(), anyhow::Error> {
             let lib2 = diaflux::decoy::generate_decoy_library(lib2);
             info!("Pass 2 library with decoys: {} precursors", lib2.len());
             let mut prepared2 = diaflux::engine::prepare_ng_library(&lib2);
-
+            diaflux::log::log_rss("lib2 + prepared2 ready (pass-1 lib dropped)");
             for (i, ws_single) in multi_ws.iter().enumerate() {
                 info!("================ Pass 2 Run: {}/{} ================", i + 1, file_num);
                 info!("File: {}", ws_single.file_name().unwrap().to_string_lossy());

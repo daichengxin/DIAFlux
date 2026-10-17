@@ -47,8 +47,8 @@ pub struct Cli {
     /// `<out_name>/transfer`.
     #[arg(long = "transfer-out")]
     pub transfer_out: Option<String>,
-    /// PeptDeep fine-tuning: number of epochs (RT/CCS and MS2).
-    #[arg(long = "finetune-epochs", default_value = "40")]
+    /// PeptDeep fine-tuning: number of epochs (RT and MS2).
+    #[arg(long = "finetune-epochs", default_value = "51")]
     pub finetune_epochs: u32,
     /// PeptDeep fine-tuning: batch size.
     #[arg(long = "finetune-batch-size", default_value = "2000")]

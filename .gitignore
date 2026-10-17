@@ -1,6 +1,10 @@
 # Build artifacts
 target/
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Test data (raw instrument files — too large for git)
 tests/test_data/
 

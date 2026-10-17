@@ -840,7 +840,17 @@ impl DiaData {
                 let stop = self.tof_indptr[t + 1] as usize;
 
                 let mut i = 0usize;
-                let mut idx = start;
+                // Skip peaks before the RT window: `push_indices[start..stop]` is
+                // ascending and `push_query[0]` is the smallest query push index,
+                // so the merge's linear walk would only `idx += 1` past them.
+                // Binary-search to the first `>= push_query[0]` instead — same
+                // match set, same accumulation order (result bit-identical).
+                let mut idx = if n_push > 0 {
+                    start + self.push_indices[start..stop]
+                        .partition_point(|&pi| pi < push_query[0])
+                } else {
+                    start
+                };
                 while idx < stop && i < n_push {
                     let pq = push_query[i];
                     let pi = self.push_indices[idx];
@@ -961,7 +971,17 @@ impl DiaData {
                 let stop = self.tof_indptr[t + 1] as usize;
 
                 let mut i = 0usize;
-                let mut idx = start;
+                // Skip peaks before the RT window: `push_indices[start..stop]` is
+                // ascending and `push_query[0]` is the smallest query push index,
+                // so the merge's linear walk would only `idx += 1` past them.
+                // Binary-search to the first `>= push_query[0]` instead — same
+                // match set, same accumulation order (result bit-identical).
+                let mut idx = if n_push > 0 {
+                    start + self.push_indices[start..stop]
+                        .partition_point(|&pi| pi < push_query[0])
+                } else {
+                    start
+                };
                 while idx < stop && i < n_push {
                     let pq = push_query[i];
                     let pi = self.push_indices[idx];
@@ -1302,6 +1322,121 @@ mod tests {
         // count of elements <= v, matching searchsorted_right(desc[::-1], v)
         assert_eq!(searchsorted_right_reversed(&desc, 1.4), 2);
         assert_eq!(searchsorted_right_reversed(&desc, 1.6), 3);
+    }
+
+    /// Minimal `DiaData` with just the CSR fields the dense assembly needs.
+    fn minimal_dia(
+        scan_max_index: usize,
+        cycle_len: usize,
+        zeroth_frame: bool,
+        push_indices: Vec<u32>,
+        tof_indptr: Vec<i64>,
+        intensity_values: Vec<u32>,
+    ) -> DiaData {
+        DiaData {
+            rt_values: vec![],
+            accumulation_times: vec![],
+            intensity_corrections: vec![],
+            max_accumulation_time: 0.0,
+            frame_max_index: 0,
+            mobility_values: vec![],
+            mobility_min_value: 0.0,
+            mobility_max_value: 0.0,
+            scan_max_index,
+            mz_values: vec![],
+            tof_max_index: 0,
+            cycle_len,
+            cycle_mz: vec![],
+            dia_precursor_cycle: vec![],
+            quad_mz_values: vec![],
+            precursor_indices: vec![],
+            raw_quad_indptr: vec![],
+            quad_indptr: vec![],
+            quad_max_mz_value: 0.0,
+            quad_min_mz_value: 0.0,
+            precursor_max_index: 0,
+            precursor_cycle_max_index: 0,
+            push_indices,
+            tof_indptr,
+            intensity_values,
+            zeroth_frame,
+            has_ms1: false,
+            has_mobility: false,
+            use_calibrated_mz_values_as_default: false,
+        }
+    }
+
+    #[test]
+    fn assemble_push_intensity_binary_search_jump() {
+        // One tof bin holds 5 peaks at push indices 0..5 (ascending); the RT
+        // window only covers push indices 3..5. The merge must binary-search
+        // past 0,1,2 and still find 3,4.
+        let dia = minimal_dia(
+            1,
+            1,
+            false,
+            vec![0, 1, 2, 3, 4],
+            vec![0i64, 5],
+            vec![10, 20, 30, 40, 50],
+        );
+
+        let tof_limits = vec![[0i64, 1, 1]];
+        let push_query = vec![3u32, 4];
+        let precursor_index = vec![3i64, 4];
+        let frame_limits = [3i64, 5, 1];
+        let scan_limits = [0i64, 1, 1];
+
+        let (dense, uniq) = dia.assemble_push_intensity(
+            &tof_limits,
+            &push_query,
+            &precursor_index,
+            frame_limits,
+            scan_limits,
+        );
+
+        assert_eq!(dense.shape(), &[1, 1, 1, 2]);
+        assert_eq!(dense[[0, 0, 0, 0]], 40.0);
+        assert_eq!(dense[[0, 0, 0, 1]], 50.0);
+        assert_eq!(uniq, vec![3, 4]);
+    }
+
+    #[test]
+    fn assemble_push_binary_search_jump() {
+        // Same window-in-the-middle-of-the-bin scenario for the two-channel
+        // assembly: intensity channel must land on the window's peaks only.
+        let dia = minimal_dia(
+            1,
+            1,
+            false,
+            vec![0, 1, 2, 3, 4],
+            vec![0i64, 5],
+            vec![10, 20, 30, 40, 50],
+        );
+
+        let tof_limits = vec![[0i64, 1, 1]];
+        let mz_values = vec![405.0f64];
+        let push_query = vec![3u32, 4];
+        // Real scoring passes one quadrupole window, so every push in the
+        // window shares the same `frame_in_cycle` value (one unique precursor).
+        let precursor_index = vec![3i64, 3];
+        let frame_limits = [3i64, 5, 1];
+        let scan_limits = [0i64, 1, 1];
+
+        let (dense, uniq) = dia.assemble_push(
+            &tof_limits,
+            &mz_values,
+            &push_query,
+            &precursor_index,
+            frame_limits,
+            scan_limits,
+            7.0,
+            true,
+        );
+
+        assert_eq!(dense.shape(), &[2, 1, 1, 1, 2]);
+        assert_eq!(dense[[0, 0, 0, 0, 0]], 40.0);
+        assert_eq!(dense[[0, 0, 0, 0, 1]], 50.0);
+        assert_eq!(uniq, vec![3]);
     }
 }
 

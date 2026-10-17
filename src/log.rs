@@ -120,4 +120,29 @@ impl io::Write for LogFileGuard {
 // Module-level convenience re-exports
 // ---------------------------------------------------------------------------
 
+/// Log the process's current and peak resident-set size (from /proc/self/status)
+/// under a caller-supplied tag. Enabled only when `DIAFORGE_MEM_PROFILE` is set,
+/// for memory triage without polluting normal runs.
+pub fn log_rss(tag: &str) {
+    if std::env::var("DIAFORGE_MEM_PROFILE").is_err() {
+        return;
+    }
+    let mut rss_kb: Option<u64> = None;
+    let mut hwm_kb: Option<u64> = None;
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(v) = line.strip_prefix("VmRSS:") {
+                rss_kb = v.trim().trim_end_matches(" kB").parse().ok();
+            } else if let Some(v) = line.strip_prefix("VmHWM:") {
+                hwm_kb = v.trim().trim_end_matches(" kB").parse().ok();
+            }
+        }
+    }
+    let fmt = |kb: Option<u64>| {
+        kb.map(|k| format!("{:.2} GiB", k as f64 / 1024.0 / 1024.0))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    info!("mem: {tag}: rss={} hwm={}", fmt(rss_kb), fmt(hwm_kb));
+}
+
 pub use tracing::{debug, error, info, warn};

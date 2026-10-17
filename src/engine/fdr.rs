@@ -435,6 +435,16 @@ fn adam_update(
 // BinaryClassifier
 // ===========================================================================
 
+/// Parse a `usize` tuning override from the environment, falling back to
+/// `default` when it is unset or malformed.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
 /// `BinaryClassifierLegacyNewBatching` — wraps `FeedForwardNN`.
 pub struct BinaryClassifier {
     pub input_dim: usize,
@@ -442,6 +452,17 @@ pub struct BinaryClassifier {
     pub test_size: f32,
     pub batch_size: usize,
     pub epochs: usize,
+    /// Epochs for a *subsequent* `fit` on an already-fitted classifier.
+    ///
+    /// Defaults to `epochs` (behavior unchanged from before this field
+    /// existed). The RT-optimization loop re-fits the same classifier once per
+    /// iteration as the candidate set slowly changes with the RT tolerance; the
+    /// weights and Adam moment estimates already carry the previous iteration's
+    /// signal, so in principle fewer epochs suffice. In practice, cutting this
+    /// to 3 cost ~2.9% PSMs on the mixed-species benchmark, so the default keeps
+    /// the full budget and the knob (`DIAFORGE_FDR_WARM_EPOCHS`) is left for
+    /// experiments.
+    pub warm_epochs: usize,
     pub learning_rate: f32,
     pub weight_decay: f32,
     pub layers: Vec<usize>,
@@ -457,12 +478,15 @@ impl BinaryClassifier {
     /// by the PeptideCentricWorkflow `_get_classifier_base` (NOT the class-body
     /// defaults): `test_size=0.001`, `batch_size=5000`, `learning_rate=0.001`.
     pub fn new(seed: u64) -> Self {
+        let epochs = env_usize("DIAFORGE_FDR_EPOCHS", 10);
+        let warm_epochs = env_usize("DIAFORGE_FDR_WARM_EPOCHS", epochs);
         BinaryClassifier {
             input_dim: 10,
             output_dim: 2,
             test_size: 0.001,
             batch_size: 5000,
-            epochs: 10,
+            epochs,
+            warm_epochs,
             learning_rate: 0.001,
             weight_decay: 0.00001,
             layers: vec![100, 50, 20, 5],
@@ -550,8 +574,14 @@ impl BinaryClassifier {
             }
         });
 
+        // A re-fit of an already-fitted classifier keeps its weights and Adam
+        // moment estimates from the previous stage. `warm_epochs` defaults to
+        // `epochs`, so this is a no-op behavior change unless the caller (or the
+        // DIAFORGE_FDR_WARM_EPOCHS env var) opts into a smaller warm budget.
+        let epochs = if self.fitted { self.warm_epochs } else { self.epochs };
+
         let network = self.network.as_mut().unwrap();
-        for _epoch in 0..self.epochs {
+        for _epoch in 0..epochs {
             let mut order: Vec<usize> = (0..num_batches).collect();
             order.shuffle(&mut rng);
             for &b in &order {
@@ -960,6 +990,56 @@ mod tests {
         assert!(
             d_mean > t_mean,
             "decoy proba should exceed target proba (t={t_mean:.3} d={d_mean:.3})"
+        );
+    }
+
+    /// Two well-separated synthetic candidate sets, differing only in offset.
+    fn separable(n: usize, f: usize, shift: f32) -> (Array2<f32>, Vec<f32>) {
+        let mut x = Array2::zeros((n, f));
+        let mut y = vec![0.0f32; n];
+        for i in 0..n {
+            let is_decoy = i >= n / 2;
+            y[i] = is_decoy as u8 as f32;
+            for j in 0..f {
+                let center = if is_decoy { -1.0 } else { 1.0 };
+                x[[i, j]] = shift + center + ((i * 7 + j * 13) % 10) as f32 * 0.05;
+            }
+        }
+        (x, y)
+    }
+
+    #[test]
+    fn refit_uses_warm_epochs_and_keeps_weights() {
+        let (x, y) = separable(400, 8, 0.0);
+        let mut clf = BinaryClassifier::new(42);
+        clf.batch_size = 64;
+        clf.epochs = 3;
+        clf.fit(&x, &y);
+
+        let before = clf.predict_proba(&x);
+
+        // With `warm_epochs = 0` a re-fit must be a pure no-op: the classifier
+        // keeps the weights and Adam state from the first fit, so predictions
+        // are bit-identical even though the second call gets different data.
+        clf.warm_epochs = 0;
+        let (x2, y2) = separable(400, 8, 5.0);
+        clf.fit(&x2, &y2);
+        let after = clf.predict_proba(&x);
+        assert_eq!(
+            before, after,
+            "warm_epochs=0 refit must not touch the network"
+        );
+
+        // Control: with warm epochs the same re-fit does move the weights.
+        clf.warm_epochs = 3;
+        clf.fit(&x2, &y2);
+        let moved = clf.predict_proba(&x);
+        let max_diff = (0..400)
+            .map(|i| (moved[[i, 1]] - after[[i, 1]]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-6,
+            "warm_epochs>0 refit should update the weights (max_diff={max_diff:e})"
         );
     }
 }

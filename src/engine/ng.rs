@@ -14,7 +14,7 @@ use crate::engine::data::{DiaData, FragmentDf, SpecLibFlat};
 use crate::engine::fdr::{get_q_values, keep_best, perform_fdr, BinaryClassifier, FdrConfig, FdrOutput};
 use crate::engine::result::{CoreResult, QuantOutput};
 use crate::engine::scoring;
-use crate::log::info;
+use crate::log::{info, log_rss};
 use crate::model::SpectralLibrary;
 
 pub use crate::engine::scoring::{NgScoring, NgScoringConfig, NG_FEATURE_COUNT, NG_FEATURE_NAMES};
@@ -162,6 +162,16 @@ const MIN_CALIBRATION_PRECURSORS: usize = 20;
 const RT_UPDATE_FACTOR: f64 = 1.5;
 const RT_UPDATE_PERCENTILE: f64 = 0.999;
 
+/// Automatic RT optimizer convergence (reference `calibration` config): iterate
+/// search → LOESS calibration → tolerance proposal until the proposed tolerance
+/// stabilizes (relative change < `RT_PARAM_CHANGE`) or the feature (targets
+/// passing FDR) drops by more than `RT_FEATURE_DECREASE` over two consecutive
+/// steps (`try_narrower_values`), after at least `RT_MIN_STEPS` iterations.
+const RT_MAX_STEPS: usize = 20;
+const RT_MIN_STEPS: usize = 5;
+const RT_PARAM_CHANGE: f64 = 0.05;
+const RT_FEATURE_DECREASE: f64 = 0.1;
+
 /// One NG search stage: selection → scoring → FDR.
 struct NgStage {
     result: scoring::NgScoringResult,
@@ -188,6 +198,7 @@ fn ng_stage(
         rt_tolerance,
         candidates.len()
     );
+    log_rss(&format!("after selection (rt={rt_tolerance:.0}s)"));
 
     let scoring = NgScoring::new(config.scoring.clone());
     let result = scoring.score(dia_data, spec, idf, cycle_rt, &candidates);
@@ -197,6 +208,7 @@ fn ng_stage(
         result.features.nrows(),
         result.features.ncols()
     );
+    log_rss("after scoring");
 
     if std::env::var("DIAFORGE_SIMPLE_FDR").is_ok() {
         report_simple_score_fdr(&result);
@@ -214,6 +226,7 @@ fn ng_stage(
         &channel,
         &fdr_cfg,
     );
+    log_rss("after fdr");
     NgStage { result, fdr }
 }
 
@@ -677,6 +690,30 @@ fn calibrate_rt(spec: &mut SpecLibFlat, stage: &NgStage) -> Option<f64> {
     Some(rt_tolerance)
 }
 
+/// `AutomaticRTOptimizer._just_converged` (try_narrower_values branch): stop when
+/// the proposed tolerance has stopped moving (<5% relative) or the feature
+/// (targets passing FDR — proportional to the reference's
+/// `precursor_proportion_detected`) has dropped by more than 10% over the last
+/// two steps. Called only after `RT_MIN_STEPS` iterations.
+fn rt_converged(n_pass_history: &[usize], new_tol: f64, cur_tol: f64) -> bool {
+    // parameter-not-substantially-changed
+    if cur_tol > 0.0 && (new_tol - cur_tol).abs() / cur_tol < RT_PARAM_CHANGE {
+        return true;
+    }
+    // feature-substantially-decreased over two consecutive steps
+    let n = n_pass_history.len();
+    if n >= 3 {
+        let f_last = n_pass_history[n - 1] as f64;
+        let f_2nd = n_pass_history[n - 2] as f64;
+        let f_3rd = n_pass_history[n - 3] as f64;
+        if f_2nd > 0.0 && f_3rd > 0.0 {
+            return (f_last - f_2nd) / f_2nd < -RT_FEATURE_DECREASE
+                && (f_last - f_3rd) / f_3rd < -RT_FEATURE_DECREASE;
+        }
+    }
+    false
+}
+
 /// Run the full peak-group search: two-stage (initial wide RT → RT calibration
 /// → optimized narrow RT), selection → scoring → FDR → target filter.
 ///
@@ -732,49 +769,124 @@ pub fn run_ng(
         .unwrap_or(config.selection.rt_tolerance);
 
     let mut classifier = BinaryClassifier::new(config.fdr.seed);
-    let stage1 = ng_stage(dia_data, &spec, idf, &cycle_rt, config, initial_rt, &mut classifier, false);
-    info!(
-        "ng: stage 1 (initial, rt={:.0}s) -> {} targets pass q <= {}",
-        initial_rt,
-        count_passing(&stage1, config.fdr_level),
-        config.fdr_level
-    );
-    if std::env::var("DIAFORGE_FEAT_DUMP").is_ok() {
-        report_feature_diagnostics(&analyze_features(&stage1.result), "stage1");
-    }
-    report_selection_ceiling(&stage1.result, "stage1");
+    let rt_max_steps = std::env::var("DIAFORGE_RT_MAX_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(RT_MAX_STEPS);
+    let rt_min_steps = std::env::var("DIAFORGE_RT_MIN_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(RT_MIN_STEPS);
+    let manual_rt = std::env::var("DIAFORGE_RT_TOL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
 
-    // 3. RT calibration + optimized re-search.
-    let (stage, stage_name) = match calibrate_rt(&mut *spec, &stage1) {
-        Some(rt_tolerance) => {
-            // Manual override for experiments (the automatic tolerance can be
-            // far too wide when the library RT is poorly calibrated).
-            let rt_tolerance = std::env::var("DIAFORGE_RT_TOL")
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(rt_tolerance);
-            // Warm-start: reuse the stage-1 classifier weights for stage 2
-            // instead of retraining on the (narrower) stage-2 candidate set.
-            // Cuts ~5 min but drops ~11% of PSMs (stage-1 weights are
-            // miscalibrated for the stage-2 feature distribution), so it is
-            // opt-in via env and OFF for benchmark runs.
-            let reuse_fitted = std::env::var("DIAFORGE_FDR_REUSE").is_ok();
-            let stage2 = ng_stage(dia_data, &spec, idf, &cycle_rt, config, rt_tolerance, &mut classifier, reuse_fitted);
+    // 3. RT optimization: either a single re-search at a manual fixed tolerance
+    //    (experiments), or the automatic convergence loop (search → LOESS
+    //    calibration → tolerance proposal until the tolerance stabilizes / the
+    //    feature plateaus), returning the history optimum.
+    let (stage, stage_name): (NgStage, &str) = if let Some(fixed) = manual_rt {
+        // Manual override for experiments (the automatic tolerance can be far
+        // too wide when the library RT is poorly calibrated).
+        let stage1 = ng_stage(dia_data, &spec, idf, &cycle_rt, config, initial_rt, &mut classifier, false);
+        info!(
+            "ng: stage 1 (initial, rt={:.0}s) -> {} targets pass q <= {}",
+            initial_rt,
+            count_passing(&stage1, config.fdr_level),
+            config.fdr_level
+        );
+        spec.precursor_df.rt_pred = original_rt_pred.clone();
+        match calibrate_rt(&mut *spec, &stage1) {
+            Some(_) => {
+                let stage2 = ng_stage(dia_data, &spec, idf, &cycle_rt, config, fixed, &mut classifier, false);
+                info!(
+                    "ng: stage 2 (fixed, rt={:.2}s) -> {} targets pass q <= {}",
+                    fixed,
+                    count_passing(&stage2, config.fdr_level),
+                    config.fdr_level
+                );
+                (stage2, "optimized (fixed)")
+            }
+            None => (stage1, "initial (uncalibrated)"),
+        }
+    } else {
+        // Automatic RT optimizer loop. Every iteration re-fits the same FDR
+        // classifier deterministically (fixed seed, no shuffling across runs),
+        // so per-iteration target counts are directly comparable for the
+        // history-optimum selection below. Iterations after the first warm-start
+        // from the previous weights and train only `warm_epochs`.
+
+        // Keep only the (rt_tolerance, n_pass) trail plus the single best stage.
+        // Retaining every iteration's full feature matrix (~n_candidates × 40 ×
+        // 4 bytes ≈ 8 GB each) is the dominant memory cost and OOMs on large
+        // files; the history-optimum only needs `n_pass` to pick the winner.
+        let mut history: Vec<(f64, usize)> = Vec::new();
+        let mut best_stage: Option<NgStage> = None;
+        let mut best_n_pass: usize = 0;
+        let mut rt_tolerance = initial_rt;
+        loop {
+            let stage = ng_stage(dia_data, &spec, idf, &cycle_rt, config, rt_tolerance, &mut classifier, false);
+            let n_pass = count_passing(&stage, config.fdr_level);
             info!(
-                "ng: stage 2 (optimized, rt={:.2}s) -> {} targets pass q <= {}",
+                "ng: opt iter {} (rt={:.2}s) -> {} targets pass q <= {}",
+                history.len(),
                 rt_tolerance,
-                count_passing(&stage2, config.fdr_level),
+                n_pass,
                 config.fdr_level
             );
-            if std::env::var("DIAFORGE_FEAT_DUMP").is_ok() {
-                report_feature_diagnostics(&analyze_features(&stage2.result), "stage2");
-                report_passing_separation(&stage2.result, &stage2.fdr, "stage2");
+
+            // Reset to the original prediction so the LOESS always fits
+            // original → observed (calibrate_rt overwrites rt_pred in place).
+            spec.precursor_df.rt_pred = original_rt_pred.clone();
+            let new_tol = calibrate_rt(&mut *spec, &stage);
+
+            // `Iterator::max_by` returns the LAST element on equal `n_pass`, so
+            // `>=` reproduces that tie-breaking exactly (bit-identical choice).
+            if n_pass >= best_n_pass {
+                best_n_pass = n_pass;
+                best_stage = Some(stage);
             }
-            report_selection_ceiling(&stage2.result, "stage2");
-            (stage2, "optimized")
+            history.push((rt_tolerance, n_pass));
+
+            let Some(new_tol) = new_tol else {
+                break; // too few targets / degenerate fit: keep the last stage
+            };
+            if history.len() >= rt_min_steps {
+                let n_pass: Vec<usize> = history.iter().map(|h| h.1).collect();
+                if rt_converged(&n_pass, new_tol, rt_tolerance) {
+                    break;
+                }
+            }
+            rt_tolerance = new_tol;
+            if history.len() >= rt_max_steps {
+                break;
+            }
         }
-        None => (stage1, "initial (uncalibrated)"),
+
+        // History optimum: the iteration with the most targets passing FDR
+        // (reference `_find_index_of_optimum`, `favour_narrower_optimum=False`).
+        let best_idx = history
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.1.cmp(&b.1))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        info!(
+            "ng: rt optimization ran {} iteration(s); best = iter {} (rt={:.2}s, {} targets)",
+            history.len(),
+            best_idx,
+            history[best_idx].0,
+            history[best_idx].1
+        );
+        let best_stage = best_stage.expect("at least one stage is always run");
+        (best_stage, "optimized")
     };
+
+    if std::env::var("DIAFORGE_FEAT_DUMP").is_ok() {
+        report_feature_diagnostics(&analyze_features(&stage.result), stage_name);
+        report_passing_separation(&stage.result, &stage.fdr, stage_name);
+    }
+    report_selection_ceiling(&stage.result, stage_name);
 
     // 3.5. optional full-candidate dump for offline loss-point overlap analysis.
     if let Ok(p) = std::env::var("DIAFORGE_CAND_DUMP") {
@@ -812,5 +924,35 @@ pub fn run_ng(
         proba,
         rt_observed,
         quant: QuantOutput::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rt_converges_when_tolerance_stops_moving() {
+        // The proposed tolerance is within 5% of the current one → converge
+        // regardless of the target-count feature.
+        assert!(rt_converged(&[1000, 1005, 1010], 21.0, 20.5));
+        // A large relative change does not converge.
+        assert!(!rt_converged(&[1000, 1005, 1010], 25.0, 20.0));
+    }
+
+    #[test]
+    fn rt_converges_on_feature_decrease() {
+        // Feature drops >10% over two consecutive steps (narrower window hurts
+        // recall) → converge even though the tolerance is still moving.
+        let n_pass = [1000usize, 1000, 950, 800]; // -20% then -16% from 950/1000
+        assert!(rt_converged(&n_pass, 8.0, 12.0));
+    }
+
+    #[test]
+    fn rt_does_not_converge_early() {
+        // Fewer than 3 steps with a flat/rising feature and a moving tolerance
+        // must not converge.
+        let n_pass = [1000usize, 1010, 1020, 1030];
+        assert!(!rt_converged(&n_pass, 9.0, 12.0));
     }
 }

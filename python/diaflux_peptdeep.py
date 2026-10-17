@@ -28,7 +28,7 @@ Usage:
       [--model-path <dir with rt.pth/ms2.pth>] [--max-precursors N]
   python diaflux_peptdeep.py finetune --precursors <transfer_precursors.parquet> \
       --fragments <transfer_fragments.parquet> --out-dir <dir> \
-      [--epochs 40] [--batch-size 2000] [--lr 0.0001]
+      [--epochs 51] [--batch-size 2000] [--lr 0.0001]
 """
 import argparse
 import os
@@ -37,11 +37,14 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
 
 from alphabase.peptide.fragment import get_charged_frag_types
 from alphabase.protein.fasta import SpecLibFasta, protease_dict
+from peptdeep.model.model_interface import CallbackHandler, LR_SchedulerInterface
 from peptdeep.pretrained_models import ModelManager
 from peptdeep.settings import global_settings
+from torch.optim.lr_scheduler import LambdaLR
 
 # UniMod ids used in DIA-NN Modified.Sequence notation.
 MOD_NAME_TO_UNIMOD = {
@@ -85,11 +88,43 @@ def build_modified_sequence(sequence: str, mods: str, mod_sites: str) -> str:
 
 
 def build_modified_sequences_vec(seqs, mods, mod_sites):
-    """Vector-ish wrapper: build DIA-NN modified sequences for many precursors."""
-    return np.array(
-        [build_modified_sequence(s, m, st) for s, m, st in zip(seqs, mods, mod_sites)],
+    """Build DIA-NN modified sequences for many precursors.
+
+    `build_modified_sequence` runs once per *unique* (sequence, mods, mod_sites)
+    triple — the candidate set is mostly unmodified, so there are far fewer
+    unique triples than precursors — then the per-precursor results are mapped
+    back by index. This replaces an 11M-iteration Python loop with a single
+    factorize + take.
+    """
+    # '\x1f' cannot appear in any of the three fields, so a joined key round-trips
+    # through a single split. `.astype(str)` is the identity on the string
+    # columns (unmodified precursors are the empty string).
+    key = (
+        pd.Series(seqs, dtype=object).astype(str)
+        + "\x1f"
+        + pd.Series(mods, dtype=object).astype(str)
+        + "\x1f"
+        + pd.Series(mod_sites, dtype=object).astype(str)
+    )
+    codes, uniq = key.factorize()
+    uniq = uniq.astype(str).to_numpy()
+
+    # Split the (few) unique keys back into their three fields.
+    uniq_seq = np.empty(len(uniq), dtype=object)
+    uniq_mods = np.empty(len(uniq), dtype=object)
+    uniq_sites = np.empty(len(uniq), dtype=object)
+    for i, k in enumerate(uniq):
+        s, m, st = k.split("\x1f", 2)
+        uniq_seq[i] = s
+        uniq_mods[i] = m
+        uniq_sites[i] = st
+
+    uniq_modseq = np.array(
+        [build_modified_sequence(s, m, st)
+         for s, m, st in zip(uniq_seq, uniq_mods, uniq_sites)],
         dtype=object,
     )
+    return uniq_modseq[codes]
 
 
 def top_k_mask(group_ids: np.ndarray, scores: np.ndarray, k: int) -> np.ndarray:
@@ -317,7 +352,8 @@ def cmd_predict(args) -> None:
 
     # Per-precursor attributes (computed once, indexed by fragment precursor).
     mod_seqs = build_modified_sequences_vec(seqs, mods, mod_sites)
-    pr_ids = np.array([f"{m}{c}" for m, c in zip(mod_seqs, charges)], dtype=object)
+    # Precursor.Id = Modified.Sequence + charge (DIA-NN notation), vectorized.
+    pr_ids = np.char.add(mod_seqs.astype(str), charges.astype(str)).astype(object)
     f_prid = pr_ids[f_prec]
     f_modseq = mod_seqs[f_prec]
     f_seq = seqs[f_prec]
@@ -368,69 +404,232 @@ def _refine_transfer_df(precursor_df: pd.DataFrame, fragment_df: pd.DataFrame):
     """
     order = precursor_df.sort_values("nAA").index.values
     precursor_df = precursor_df.loc[order].reset_index(drop=True)
-    starts = []
-    stops = []
-    blocks = []
-    start = 0
-    for i in range(len(precursor_df)):
-        s = int(precursor_df.loc[i, "frag_start_idx"])
-        e = int(precursor_df.loc[i, "frag_stop_idx"])
-        blocks.append(fragment_df.iloc[s:e])
-        starts.append(start)
-        start += e - s
-        stops.append(start)
-    precursor_df["frag_start_idx"] = starts
-    precursor_df["frag_stop_idx"] = stops
-    fragment_df = pd.concat(blocks, ignore_index=True)
+    starts = precursor_df["frag_start_idx"].to_numpy()
+    stops = precursor_df["frag_stop_idx"].to_numpy()
+    lengths = stops - starts
+    # Contiguous output blocks in the new (nAA-sorted) order.
+    new_starts = np.empty_like(lengths)
+    new_starts[0] = 0
+    if len(lengths) > 1:
+        new_starts[1:] = np.cumsum(lengths[:-1])
+    new_stops = new_starts + lengths
+    precursor_df["frag_start_idx"] = new_starts
+    precursor_df["frag_stop_idx"] = new_stops
+    # Single vectorized take into the source fragment frame: for each output row
+    # (concatenated nAA-sorted blocks) map back to its original fragment row.
+    total = int(lengths.sum())
+    source_idx = np.repeat(starts, lengths) + (
+        np.arange(total) - np.repeat(new_starts, lengths)
+    )
+    fragment_df = fragment_df.iloc[source_idx].reset_index(drop=True)
     return precursor_df, fragment_df
+
+
+def _block_pearson(x: np.ndarray, y: np.ndarray, gid: np.ndarray) -> np.ndarray:
+    """Per-group Pearson correlation of flat arrays, via bincount accumulation.
+
+    `gid[i]` is the group of observation `i`; groups are 0..n_groups-1 and must
+    be contiguous (no gaps). Returns one correlation per group (NaN for a group
+    with zero variance).
+    """
+    n = np.bincount(gid, minlength=gid[-1] + 1).astype(np.float64)
+    xf = x.astype(np.float64)
+    yf = y.astype(np.float64)
+    sx = np.bincount(gid, weights=xf, minlength=n.size)
+    sy = np.bincount(gid, weights=yf, minlength=n.size)
+    sxy = np.bincount(gid, weights=xf * yf, minlength=n.size)
+    sx2 = np.bincount(gid, weights=xf * xf, minlength=n.size)
+    sy2 = np.bincount(gid, weights=yf * yf, minlength=n.size)
+    num = n * sxy - sx * sy
+    den = np.sqrt(
+        np.maximum(n * sx2 - sx * sx, 0.0) * np.maximum(n * sy2 - sy * sy, 0.0)
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+
+
+def _block_cosine(x: np.ndarray, y: np.ndarray, gid: np.ndarray) -> np.ndarray:
+    """Per-group cosine similarity of flat arrays, via bincount accumulation."""
+    xf = x.astype(np.float64)
+    yf = y.astype(np.float64)
+    sxy = np.bincount(gid, weights=xf * yf, minlength=gid[-1] + 1)
+    sx2 = np.bincount(gid, weights=xf * xf, minlength=gid[-1] + 1)
+    sy2 = np.bincount(gid, weights=yf * yf, minlength=gid[-1] + 1)
+    den = np.sqrt(np.maximum(sx2, 0.0) * np.maximum(sy2, 0.0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(den > 0, sxy / np.where(den > 0, den, 1.0), np.nan)
 
 
 def _ms2_similarity_report(mgr: ModelManager, precursor_df: pd.DataFrame,
                            fragment_df: pd.DataFrame) -> None:
     """Compute PCC/COS/SPC between the fine-tuned model and the transfer target.
 
-    PeptDeep 1.3.2's `ms2_model.test()` passes `reference_frag_df`, which forces
-    the out-of-order predict path whose `update_sliced_fragment_dataframe` write
-    is dropped (a stock alphabase bug), so `test()` spuriously reports PCC=0.
-    Here we predict in-order (no reference) and slice the target ourselves.
+    `ms2_model.predict(..., reference_frag_df=None)` writes its predictions back
+    in-order *only* when the precursor frame is nAA-sorted with contiguous
+    `frag_start_idx`; otherwise the out-of-order `update_sliced_fragment_dataframe`
+    write is dropped (a stock alphabase bug) and the report spuriously prints
+    PCC=0. So sort + reindex the full set first, predict in-order, then compare
+    the two fragment frames block-wise — all vectorized, no per-precursor loop.
     """
-    import torch
-    from peptdeep.model.ms2 import pearson_correlation, spearman_correlation
-    from alphabase.peptide.fragment import get_sliced_fragment_dataframe
-
+    precursor_df, fragment_df = _refine_transfer_df(precursor_df, fragment_df)
     sub = precursor_df.copy()
     mgr.set_default_nce_instrument(sub)
     pred = mgr.ms2_model.predict(sub, reference_frag_df=None)
     cols = ["b_z1", "b_z2", "y_z1", "y_z2"]
     pred_np = pred[cols].to_numpy(dtype=np.float32)
 
-    # Normalize the target per precursor (max -> 1).
-    tgt = fragment_df[cols].to_numpy(dtype=np.float32).copy()
-    for start, stop in zip(precursor_df["frag_start_idx"],
-                           precursor_df["frag_stop_idx"], strict=True):
-        blk = tgt[start:stop]
-        mx = blk.max()
-        if mx > 0:
-            blk[:] = blk / mx
+    starts = precursor_df["frag_start_idx"].to_numpy()
+    stops = precursor_df["frag_stop_idx"].to_numpy()
+    lengths = stops - starts
+    n_prec = len(lengths)
 
-    pccs, coss, spcs = [], [], []
-    device = "cpu"
-    for start, stop in zip(precursor_df["frag_start_idx"],
-                           precursor_df["frag_stop_idx"], strict=True):
-        tt = torch.tensor(tgt[start:stop], dtype=torch.float32).reshape(1, -1)
-        if int((tt > 0).sum()) < 1:
-            continue
-        pp = torch.tensor(pred_np[start:stop], dtype=torch.float32).reshape(1, -1)
-        pccs.append(float(pearson_correlation(pp, tt)[0]))
-        coss.append(float(torch.cosine_similarity(pp, tt, dim=1)[0]))
-        spcs.append(float(spearman_correlation(pp, tt, torch.device(device))[0]))
-    pccs = np.array(pccs)
-    coss = np.array(coss)
-    spcs = np.array(spcs)
-    print(f"MS2 similarity (n={len(pccs):,}): "
-          f"PCC median={np.median(pccs):.4f} mean={pccs.mean():.4f} | "
-          f"COS median={np.median(coss):.4f} | SPC median={np.median(spcs):.4f}",
+    # Normalize the target per precursor (max -> 1); track all-zero blocks so
+    # they can be dropped exactly as the original loop's `(tt > 0).sum() < 1`.
+    tgt = fragment_df[cols].to_numpy(dtype=np.float32)
+    row_max = tgt.max(axis=1)
+    block_max = np.maximum.reduceat(row_max, starts)
+    tgt = tgt / np.repeat(block_max, lengths)[:, None]
+    keep = block_max > 0
+
+    # Flatten (fragment, type) into one observation each, per precursor.
+    gid = np.repeat(np.arange(n_prec, dtype=np.int64), lengths * len(cols))
+    x = pred_np.ravel()
+    y = tgt.ravel()
+
+    pcc = _block_pearson(x, y, gid)
+    cos = _block_cosine(x, y, gid)
+    # Spearman = Pearson on per-block ranks (average method, matching the torch
+    # `spearman_correlation` used before).
+    rx = pd.Series(x).groupby(gid).rank(method="average").to_numpy(dtype=np.float32)
+    ry = pd.Series(y).groupby(gid).rank(method="average").to_numpy(dtype=np.float32)
+    spc = _block_pearson(rx, ry, gid)
+
+    valid = keep & np.isfinite(pcc) & np.isfinite(cos) & np.isfinite(spc)
+    pcc = pcc[valid]
+    cos = cos[valid]
+    spc = spc[valid]
+
+    print(f"MS2 similarity (n={len(pcc):,}): "
+          f"PCC median={np.median(pcc):.4f} mean={pcc.mean():.4f} | "
+          f"COS median={np.median(cos):.4f} | SPC median={np.median(spc):.4f}",
           flush=True)
+    return pcc, cos, spc
+
+
+class CustomScheduler(LR_SchedulerInterface):
+    """Linear warmup followed by ReduceLROnPlateau (reference transfer loop)."""
+
+    def __init__(self, optimizer, **kwargs):
+        self._optimizer = optimizer
+        self._num_warmup_steps = kwargs.get("num_warmup_steps", 5)
+        self._num_training_steps = kwargs.get("num_training_steps", 50)
+        self._lr_patience = kwargs.get("lr_patience", 3)
+        self._reduce_lr_on_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", patience=self._lr_patience, factor=0.5,
+        )
+        self._warmup_lr = LambdaLR(optimizer, self._warmup)
+
+    def _warmup(self, epoch):
+        return float(epoch + 1) / float(max(1, self._num_warmup_steps))
+
+    def step(self, epoch, loss):
+        if epoch < self._num_warmup_steps:
+            self._warmup_lr.step()
+        else:
+            self._reduce_lr_on_plateau.step(loss)
+
+    def get_last_lr(self):
+        return [self._optimizer.param_groups[0]["lr"]]
+
+
+class EarlyStopping:
+    """Stop training once the validation loss plateaus (reference patience=12)."""
+
+    def __init__(self, patience=5, margin=0.01):
+        self._patience = patience
+        self._best_loss = np.inf
+        self._last_loss = np.inf
+        self._margin = margin
+        self._counter = 0
+
+    def step(self, val_loss):
+        if self._last_loss != np.inf:
+            if (
+                val_loss > self._best_loss * (1 + self._margin)
+                or abs(val_loss - self._last_loss) / self._last_loss < self._margin
+            ):
+                self._counter += 1
+                if self._counter >= self._patience:
+                    return False
+            else:
+                self._best_loss = val_loss
+                self._counter = 0
+        self._last_loss = val_loss
+        return True
+
+    def reset(self):
+        self._best_loss = np.inf
+        self._last_loss = np.inf
+        self._counter = 0
+
+
+class _FinetuneCallback(CallbackHandler):
+    """Drive EarlyStopping from the validation L1 loss after each epoch."""
+
+    def __init__(self, eval_fn, early_stopping, model_name):
+        super().__init__()
+        self._eval_fn = eval_fn
+        self._early_stopping = early_stopping
+        self._model_name = model_name
+
+    def epoch_callback(self, epoch, epoch_loss):
+        val_loss = self._eval_fn()
+        continue_training = self._early_stopping.step(val_loss)
+        print(
+            f"  [{self._model_name}] epoch {epoch:3d}: train_l1={epoch_loss:.5f} "
+            f"val_l1={val_loss:.5f}  continue={continue_training}",
+            flush=True,
+        )
+        return continue_training
+
+
+def _normalize_intensity(precursor_df, fragment_intensity_df):
+    """Normalize fragment intensities per precursor (divide block by its max).
+
+    Vectorized: operate on the underlying numpy array via in-place block
+    updates, not pandas ``.iloc`` slice assignment (which re-indexes on every
+    row and turns a 265k-precursor library into minutes of overhead).
+    """
+    arr = fragment_intensity_df.to_numpy(dtype=np.float32)
+    starts = precursor_df["frag_start_idx"].to_numpy()
+    stops = precursor_df["frag_stop_idx"].to_numpy()
+    for start, stop in zip(starts, stops, strict=True):
+        blk = arr[start:stop]
+        mx = blk.max()
+        if np.isnan(mx) or mx == 0:
+            blk[:] = 0.0
+        else:
+            blk /= mx
+    fragment_intensity_df[:] = arr
+
+
+def _eval_rt_l1(mgr, precursor_df):
+    mgr.rt_model.model.eval()
+    pred = mgr.rt_model.predict(precursor_df)
+    l1 = float(np.mean(np.abs(pred["rt_pred"].values - precursor_df["rt_norm"].values)))
+    mgr.rt_model.model.train()
+    return l1
+
+
+def _eval_ms2_l1(mgr, precursor_df, fragment_df):
+    mgr.ms2_model.model.eval()
+    pred = mgr.ms2_model.predict(precursor_df.copy(), reference_frag_df=None)
+    cols = list(mgr.ms2_model.charged_frag_types)
+    pred_np = pred[cols].to_numpy(dtype=np.float32)
+    tgt_np = fragment_df[cols].to_numpy(dtype=np.float32)
+    l1 = float(np.mean(np.abs(pred_np - tgt_np)))
+    mgr.ms2_model.model.train()
+    return l1
 
 
 def cmd_finetune(args) -> None:
@@ -439,34 +638,87 @@ def cmd_finetune(args) -> None:
     fragment_df = pd.read_parquet(args.fragments)
     print(f"Loaded {len(precursor_df):,} transfer precursors, "
           f"{len(fragment_df):,} fragment rows", flush=True)
-    precursor_df, fragment_df = _refine_transfer_df(precursor_df, fragment_df)
 
-    # Training hyperparameters are read from global_settings in
-    # ModelManager.__init__, so set them before construction.
+    if "nAA" not in precursor_df.columns:
+        precursor_df["nAA"] = precursor_df["sequence"].str.len().astype(np.int32)
+
     _set_default_nce_instrument(args)
-    t = global_settings["model_mgr"]["transfer"]
-    t["epoch_rt_ccs"] = args.epochs
-    t["epoch_ms2"] = args.epochs
-    t["batch_size_rt_ccs"] = args.batch_size
-    t["batch_size_ms2"] = args.batch_size
-    t["lr_rt_ccs"] = args.lr
-    t["lr_ms2"] = args.lr
-    t["verbose"] = True
 
     print("Loading peptdeep models ...", flush=True)
     mgr = ModelManager(device="cpu")
     mgr.load_installed_models("generic")
     _move_to_device(mgr, args)
 
-    print("Fine-tuning RT model ...", flush=True)
-    mgr.train_rt_model(precursor_df)
+    # MS2 features need nce/instrument on the precursor frame; add them once up
+    # front so the full-frame pre-training eval and all splits inherit them.
+    mgr.set_default_nce_instrument(precursor_df)
 
-    print("Fine-tuning MS2 model ...", flush=True)
-    mgr.train_ms2_model(precursor_df, fragment_df)
+    # Keep only the charged fragment types the MS2 model produces (fill any
+    # missing type with zeros, mirroring the reference finetune_ms2).
+    charged_frag_types = list(mgr.ms2_model.charged_frag_types)
+    for ft in charged_frag_types:
+        if ft not in fragment_df.columns:
+            fragment_df[ft] = 0.0
+    fragment_df = fragment_df[charged_frag_types]
+
+    # Per-precursor max normalization of the MS2 targets (reference
+    # _normalize_intensity), applied once on the full set before the split.
+    _normalize_intensity(precursor_df, fragment_df)
+
+    # 0.7 / 0.2 / 0.1 split (reference sample/drop split; no fixed seed).
+    train_prec = precursor_df.sample(frac=0.7)
+    val_prec = precursor_df.drop(train_prec.index).sample(frac=0.2 / 0.3)
+    test_prec = precursor_df.drop(train_prec.index).drop(val_prec.index)
+
+    # Sort each split by nAA and rebuild contiguous fragment blocks so peptdeep
+    # takes the in-order predict path and MS2 targets align with predictions.
+    train_prec, train_frag = _refine_transfer_df(train_prec, fragment_df)
+    val_prec, val_frag = _refine_transfer_df(val_prec, fragment_df)
+    test_prec, test_frag = _refine_transfer_df(test_prec, fragment_df)
+
+    for df in (train_prec, val_prec, test_prec):
+        mgr.set_default_nce_instrument(df)
+
+    print(f"Split: train={len(train_prec):,} val={len(val_prec):,} "
+          f"test={len(test_prec):,} precursors", flush=True)
+
+    # ── RT ────────────────────────────────────────────────────────────────
+    print(f"Fine-tuning RT model ({args.epochs} epochs, warmup=5, "
+          f"batch={args.batch_size}, lr={args.lr}) ...", flush=True)
+    rt_stopping = EarlyStopping(patience=12, margin=0.01)
+    mgr.rt_model.set_lr_scheduler_class(CustomScheduler)
+    mgr.rt_model.set_callback_handler(
+        _FinetuneCallback(lambda: _eval_rt_l1(mgr, val_prec), rt_stopping, "rt")
+    )
+    print(f"  RT L1 before training (all): {_eval_rt_l1(mgr, precursor_df):.5f}",
+          flush=True)
+    mgr.rt_model.train(train_prec, batch_size=args.batch_size, epoch=args.epochs,
+                       warmup_epoch=5, lr=args.lr)
+    print(f"  RT L1 after training (test): {_eval_rt_l1(mgr, test_prec):.5f}",
+          flush=True)
+
+    # ── MS2 ───────────────────────────────────────────────────────────────
+    print(f"Fine-tuning MS2 model ({args.epochs} epochs, warmup=5, "
+          f"batch={args.batch_size}, lr={args.lr}) ...", flush=True)
+    ms2_stopping = EarlyStopping(patience=12, margin=0.01)
+    mgr.ms2_model.set_lr_scheduler_class(CustomScheduler)
+    mgr.ms2_model.set_callback_handler(
+        _FinetuneCallback(
+            lambda: _eval_ms2_l1(mgr, val_prec, val_frag), ms2_stopping, "ms2"
+        )
+    )
+    print(f"  MS2 L1 before training (all): "
+          f"{_eval_ms2_l1(mgr, precursor_df, fragment_df):.5f}", flush=True)
+    mgr.ms2_model.train(precursor_df=train_prec, fragment_intensity_df=train_frag,
+                        batch_size=args.batch_size, epoch=args.epochs,
+                        warmup_epoch=5, lr=args.lr)
+    print(f"  MS2 L1 after training (test): "
+          f"{_eval_ms2_l1(mgr, test_prec, test_frag):.5f}", flush=True)
     _ms2_similarity_report(mgr, precursor_df, fragment_df)
 
-    # Save RT + MS2 only. CCS/mobility are absent on Astral data; `predict
-    # --model-path` loads rt.pth + ms2.pth and keeps the pretrained CCS model.
+    # Save RT + MS2 only. CCS stays at its pretrained weights (the reference
+    # transfer loop fine-tunes RT + charge + MS2; its CCS fine-tune is unused
+    # dead code). `predict --model-path` loads rt.pth + ms2.pth.
     mgr.rt_model.save(os.path.join(args.out_dir, "rt.pth"))
     mgr.ms2_model.save(os.path.join(args.out_dir, "ms2.pth"))
     print(f"Saved fine-tuned models to {args.out_dir}", flush=True)
@@ -521,7 +773,7 @@ def build_parser() -> argparse.ArgumentParser:
     pf.add_argument("--instrument", default="Lumos")
     pf.add_argument("--gpu", default="cuda")
     pf.add_argument("--gpu-id", type=int, default=0)
-    pf.add_argument("--epochs", type=int, default=40)
+    pf.add_argument("--epochs", type=int, default=51)
     pf.add_argument("--batch-size", type=int, default=2000)
     pf.add_argument("--lr", type=float, default=0.0001)
     pf.set_defaults(func=cmd_finetune)
