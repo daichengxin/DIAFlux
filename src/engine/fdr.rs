@@ -634,6 +634,34 @@ impl BinaryClassifier {
         };
         softmax(&logits)
     }
+
+    /// Eval-mode softmax over the full input, writing only column 1 (the decoy
+    /// probability) into `out`. Chunking and per-row arithmetic are identical
+    /// to `predict_proba`, so `out[i] == predict_proba(x)[[i, 1]]` bit-for-bit;
+    /// it only avoids materializing the full `(n, 2)` logits/proba matrix.
+    pub fn predict_proba_col1(&self, x: &Array2<f32>, out: &mut [f32]) {
+        let network = self
+            .network
+            .as_ref()
+            .expect("classifier has not been fitted");
+        let n = x.nrows();
+        debug_assert_eq!(out.len(), n);
+        if n == 0 {
+            return;
+        }
+        const CHUNK: usize = 256_000;
+        out.par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(ci, dst)| {
+                let start = ci * CHUNK;
+                let stop = (start + CHUNK).min(n);
+                let xb = x.slice(ndarray::s![start..stop, ..]).to_owned();
+                let p = softmax(&network.forward_eval(&xb));
+                for (j, d) in dst.iter_mut().enumerate() {
+                    *d = p[[j, 1]];
+                }
+            });
+    }
 }
 
 /// Gather rows `idx` of `x` into a new array.
@@ -792,7 +820,18 @@ pub fn perform_fdr(
     let retained = if m < 2 {
         Vec::new()
     } else {
-        let x = gather_rows(features, &valid);
+        // When every candidate row has finite features (the common case),
+        // `valid` is exactly `[0..n]` (rayon filter preserves order), so
+        // `gather_rows` would produce a byte-for-byte copy of `features` — an
+        // ~(n × ncols × 4) byte transient. Train and score `features` in place
+        // instead of materializing the duplicate.
+        let x_owned;
+        let x: &Array2<f32> = if m == n {
+            features
+        } else {
+            x_owned = gather_rows(features, &valid);
+            &x_owned
+        };
         let y: Vec<f32> = valid.iter().map(|&i| decoy[i] as f32).collect();
         let n_target = y.iter().filter(|&&v| v == 0.0).count();
         let n_decoy = y.iter().filter(|&&v| v == 1.0).count();
@@ -808,8 +847,8 @@ pub fn perform_fdr(
                 classifier.fit(&x, &y);
             }
 
-            let p_full = classifier.predict_proba(&x);
-            let proba_valid: Vec<f32> = (0..m).into_par_iter().map(|i| p_full[[i, 1]]).collect();
+            let mut proba_valid = vec![0.0f32; m];
+            classifier.predict_proba_col1(&x, &mut proba_valid);
             for i in 0..m {
                 proba[valid[i]] = proba_valid[i];
             }
@@ -991,6 +1030,35 @@ mod tests {
             d_mean > t_mean,
             "decoy proba should exceed target proba (t={t_mean:.3} d={d_mean:.3})"
         );
+    }
+
+    #[test]
+    fn predict_proba_col1_matches_predict_proba() {
+        let (x, y) = separable(400, 8, 0.0);
+        let mut clf = BinaryClassifier::new(7);
+        clf.batch_size = 64;
+        clf.epochs = 3;
+        clf.fit(&x, &y);
+
+        // Small input (sequential path).
+        let p = clf.predict_proba(&x);
+        let mut col1 = vec![0.0f32; 400];
+        clf.predict_proba_col1(&x, &mut col1);
+        for i in 0..400 {
+            assert_eq!(p[[i, 1]], col1[i], "col1 mismatch at row {i}");
+        }
+
+        // Large input (chunked path) — both methods must agree bit-for-bit.
+        let big_n = 260_000usize;
+        let big = Array2::from_shape_fn((big_n, 8), |(i, j)| {
+            ((i * 7 + j * 13) % 1000) as f32 * 0.01
+        });
+        let pbig = clf.predict_proba(&big);
+        let mut col1_big = vec![0.0f32; big_n];
+        clf.predict_proba_col1(&big, &mut col1_big);
+        for i in 0..big_n {
+            assert_eq!(pbig[[i, 1]], col1_big[i], "col1 mismatch at big row {i}");
+        }
     }
 
     /// Two well-separated synthetic candidate sets, differing only in offset.
